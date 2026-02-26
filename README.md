@@ -21,18 +21,6 @@ npx serve .
 
 Then open the printed `http://localhost:...` URL and click **ENABLE WEBCAM**.
 
-Alternatives:
-
-```bash
-cd face-recognition
-npx http-server .
-```
-
-```bash
-cd face-recognition
-python3 -m http.server 5173
-```
-
 ## How it works
 
 - **FaceLandmarker** is loaded from `@mediapipe/tasks-vision@0.10.3` (CDN)
