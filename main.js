@@ -14,7 +14,7 @@
 
 import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
 
-const { FaceLandmarker, FilesetResolver, DrawingUtils } = vision;
+const { FaceLandmarker, HandLandmarker, FilesetResolver, DrawingUtils } = vision;
 
 const demosSection = document.getElementById("demos");
 const imageBlendShapes = document.getElementById("image-blend-shapes");
@@ -23,24 +23,25 @@ const videoBlendShapes = document.getElementById("video-blend-shapes");
 const hudSmileEl = document.getElementById("hud-smile");
 const hudLookAwayEl = document.getElementById("hud-lookaway");
 const hudLookAwayFlagEl = document.getElementById("hud-lookaway-flag");
+const hudHandEl = document.getElementById("hud-hand");
+const hudGestureEl = document.getElementById("hud-gesture");
 const appleDialogEl = document.getElementById("apple-dialog");
 
 let faceLandmarker;
+let handLandmarker;
 let runningMode = "IMAGE"; // "IMAGE" | "VIDEO"
 let enableWebcamButton;
 let webcamRunning = false;
 
 const videoWidth = 480;
 
-// Cache landmark index sets for look-away (perf).
-const LEFT_EYE_IDX = connectionIndices(FaceLandmarker.FACE_LANDMARKS_LEFT_EYE);
-const RIGHT_EYE_IDX = connectionIndices(FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE);
-const LEFT_IRIS_IDX = connectionIndices(FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS);
-const RIGHT_IRIS_IDX = connectionIndices(
-  FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS
-);
+// Cached landmark index sets for look-away (filled after landmarker creation).
+let LEFT_EYE_IDX = new Set();
+let RIGHT_EYE_IDX = new Set();
+let LEFT_IRIS_IDX = new Set();
+let RIGHT_IRIS_IDX = new Set();
 
-async function createFaceLandmarker() {
+async function createLandmarkers() {
   const filesetResolver = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
   );
@@ -56,10 +57,32 @@ async function createFaceLandmarker() {
     numFaces: 1,
   });
 
+  // Compute these only after the class constants are definitely available.
+  LEFT_EYE_IDX = connectionIndices(FaceLandmarker.FACE_LANDMARKS_LEFT_EYE);
+  RIGHT_EYE_IDX = connectionIndices(FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE);
+  LEFT_IRIS_IDX = connectionIndices(FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS);
+  RIGHT_IRIS_IDX = connectionIndices(FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS);
+
+  // Hand landmarker (optional; we run it throttled).
+  try {
+    handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU",
+      },
+      runningMode,
+      numHands: 1,
+    });
+  } catch (e) {
+    console.warn("HandLandmarker failed to load; continuing without hands.", e);
+    handLandmarker = null;
+  }
+
   demosSection.classList.remove("invisible");
 }
 
-createFaceLandmarker();
+createLandmarkers();
 
 /********************************************************************
 // Demo 1: Grab a bunch of images from the page and detect them
@@ -220,6 +243,10 @@ const state = {
   smile: 0,
   lookAwayScore: 0,
   lookingAway: false,
+  // hand
+  handPresent: false,
+  openPalm: false,
+  thumbsUp: false,
   // dialog stability
   dialogCurrent: "Apologize properly.",
   dialogSinceMs: performance.now(),
@@ -230,10 +257,14 @@ const state = {
     smile: "",
     look: "",
     lookFlag: "",
+    hand: "",
+    gesture: "",
     dialog: "",
   },
   // blendshape list throttle
   lastBlendshapeDomMs: 0,
+  // hand throttle
+  lastHandRunMs: 0,
 };
 
 function clamp01(x) {
@@ -351,6 +382,90 @@ function hypot2(a, b) {
   return Math.sqrt(a * a + b * b);
 }
 
+function dist2d(a, b) {
+  if (!a || !b) return 0;
+  if (typeof a.x !== "number" || typeof a.y !== "number") return 0;
+  if (typeof b.x !== "number" || typeof b.y !== "number") return 0;
+  return hypot2(a.x - b.x, a.y - b.y);
+}
+
+function isFingerExtended(handLandmarks, tipIdx, pipIdx, k) {
+  const wrist = safePoint(handLandmarks, 0);
+  const tip = safePoint(handLandmarks, tipIdx);
+  const pip = safePoint(handLandmarks, pipIdx);
+  if (!wrist || !tip || !pip) return false;
+  const factor = typeof k === "number" ? k : 1.12;
+  // Distance-from-wrist heuristic (orientation-agnostic).
+  return dist2d(wrist, tip) > dist2d(wrist, pip) * factor;
+}
+
+function isFingerFolded(handLandmarks, tipIdx, pipIdx, k) {
+  const wrist = safePoint(handLandmarks, 0);
+  const tip = safePoint(handLandmarks, tipIdx);
+  const pip = safePoint(handLandmarks, pipIdx);
+  if (!wrist || !tip || !pip) return false;
+  const factor = typeof k === "number" ? k : 1.03;
+  return dist2d(wrist, tip) < dist2d(wrist, pip) * factor;
+}
+
+function palmCenter(handLandmarks) {
+  const wrist = safePoint(handLandmarks, 0);
+  const indexMcp = safePoint(handLandmarks, 5);
+  const midMcp = safePoint(handLandmarks, 9);
+  const pinkyMcp = safePoint(handLandmarks, 17);
+  if (!wrist || !indexMcp || !midMcp || !pinkyMcp) return null;
+  return {
+    x: (wrist.x + indexMcp.x + midMcp.x + pinkyMcp.x) * 0.25,
+    y: (wrist.y + indexMcp.y + midMcp.y + pinkyMcp.y) * 0.25,
+  };
+}
+
+function computeHandGestures(handLandmarks) {
+  const indexExt = isFingerExtended(handLandmarks, 8, 6, 1.12);
+  const middleExt = isFingerExtended(handLandmarks, 12, 10, 1.12);
+  const ringExt = isFingerExtended(handLandmarks, 16, 14, 1.12);
+  const pinkyExt = isFingerExtended(handLandmarks, 20, 18, 1.12);
+  const thumbExt = isFingerExtended(handLandmarks, 4, 3, 1.18);
+
+  const extendedCount =
+    (indexExt ? 1 : 0) +
+    (middleExt ? 1 : 0) +
+    (ringExt ? 1 : 0) +
+    (pinkyExt ? 1 : 0) +
+    (thumbExt ? 1 : 0);
+
+  const openPalm = extendedCount >= 4;
+
+  // More robust thumbs-up to avoid "fist == thumbs up" false positives:
+  // - thumb extended
+  // - other fingers folded
+  // - thumb tip above thumb MCP (image y-axis) and away from palm center
+  const thumbTip = safePoint(handLandmarks, 4);
+  const thumbMcp = safePoint(handLandmarks, 2);
+  const center = palmCenter(handLandmarks);
+  const wrist = safePoint(handLandmarks, 0);
+  const midMcp = safePoint(handLandmarks, 9);
+  const scale = wrist && midMcp ? Math.max(1e-6, dist2d(wrist, midMcp)) : 1;
+
+  const othersFolded =
+    isFingerFolded(handLandmarks, 8, 6, 1.05) &&
+    isFingerFolded(handLandmarks, 12, 10, 1.05) &&
+    isFingerFolded(handLandmarks, 16, 14, 1.05) &&
+    isFingerFolded(handLandmarks, 20, 18, 1.05);
+
+  const thumbUpY =
+    !!thumbTip &&
+    !!thumbMcp &&
+    thumbTip.y < thumbMcp.y - 0.035 &&
+    (!center || thumbTip.y < center.y - 0.02);
+
+  const thumbFarFromPalm = !!thumbTip && !!center && dist2d(thumbTip, center) / scale > 0.75;
+
+  const thumbsUp = thumbExt && othersFolded && thumbUpY && thumbFarFromPalm;
+
+  return { openPalm, thumbsUp };
+}
+
 function headYawProxy(landmarks) {
   // Common FaceMesh indices: nose tip(1), left eye outer(33), right eye outer(263)
   const NOSE_TIP = 1;
@@ -409,6 +524,14 @@ function pickDialogLine(facePresent, lookingAway, smile) {
   return "Apologize properly.";
 }
 
+function pickDialogLineWithHand(facePresent, lookingAway, smile, hand) {
+  if (hand && hand.present) {
+    if (hand.thumbsUp) return "A thumbs up? You think that's enough?";
+    if (hand.openPalm) return "Okay… I hear you. Keep your eyes on me.";
+  }
+  return pickDialogLine(facePresent, lookingAway, smile);
+}
+
 function updateDialogStably(nowMs, nextLine) {
   if (state.dialogCurrent === nextLine) {
     state.dialogCandidate = null;
@@ -457,8 +580,23 @@ function updateHUD(smile, lookAwayScore, lookingAway) {
   }
 }
 
+function updateHandHUD(present, openPalm, thumbsUp) {
+  const handText = present ? "YES" : "NO";
+  const gestureText = thumbsUp ? "THUMBS_UP" : openPalm ? "OPEN_PALM" : "—";
+
+  if (state.hudLastText.hand !== handText) {
+    state.hudLastText.hand = handText;
+    setTextIfChanged(hudHandEl, handText);
+  }
+  if (state.hudLastText.gesture !== gestureText) {
+    state.hudLastText.gesture = gestureText;
+    setTextIfChanged(hudGestureEl, gestureText);
+  }
+}
+
 let lastVideoTime = -1;
 let results = undefined;
+let handResults = undefined;
 
 async function predictWebcam() {
   const radio = video.videoHeight / video.videoWidth;
@@ -472,12 +610,25 @@ async function predictWebcam() {
   if (runningMode === "IMAGE") {
     runningMode = "VIDEO";
     await faceLandmarker.setOptions({ runningMode });
+    if (handLandmarker) {
+      await handLandmarker.setOptions({ runningMode });
+    }
   }
 
   const startTimeMs = performance.now();
   if (lastVideoTime !== video.currentTime) {
     lastVideoTime = video.currentTime;
     results = faceLandmarker.detectForVideo(video, startTimeMs);
+  }
+
+  // Throttled hand inference (hands are heavier than face).
+  const HAND_INTERVAL_MS = 80; // ~12.5 fps
+  const nowForHandMs = performance.now();
+  const shouldRunHand =
+    !!handLandmarker && nowForHandMs - state.lastHandRunMs >= HAND_INTERVAL_MS;
+  if (shouldRunHand) {
+    state.lastHandRunMs = nowForHandMs;
+    handResults = handLandmarker.detectForVideo(video, startTimeMs);
   }
 
   canvasCtx.save();
@@ -490,6 +641,9 @@ async function predictWebcam() {
   let facePresent = false;
   let rawSmile = 0;
   let rawLookAwayScore = 0;
+  let handPresent = false;
+  let handOpenPalm = false;
+  let handThumbsUp = false;
 
   if (results && results.faceLandmarks && results.faceLandmarks.length) {
     facePresent = true;
@@ -546,6 +700,29 @@ async function predictWebcam() {
     }
   }
 
+  if (handResults && handResults.landmarks && handResults.landmarks.length) {
+    handPresent = true;
+
+    for (const handLandmarks of handResults.landmarks) {
+      const conns = HandLandmarker.HAND_CONNECTIONS || [];
+      if (conns.length) {
+        drawingUtils.drawConnectors(handLandmarks, conns, {
+          color: "#00D1FF",
+          lineWidth: 2,
+        });
+      }
+      drawingUtils.drawLandmarks(handLandmarks, {
+        color: "#00D1FF",
+        lineWidth: 1,
+        radius: 2,
+      });
+
+      const g = computeHandGestures(handLandmarks);
+      handOpenPalm = handOpenPalm || g.openPalm;
+      handThumbsUp = handThumbsUp || g.thumbsUp;
+    }
+  }
+
   if (results && results.faceBlendshapes && results.faceBlendshapes.length) {
     const categories = results.faceBlendshapes[0]?.categories;
     const cat = blendshapesToMap(categories);
@@ -569,11 +746,17 @@ async function predictWebcam() {
 
   updateHUD(state.smile, state.lookAwayScore, state.lookingAway);
 
-  const nextLine = pickDialogLine(
-    facePresent,
-    state.lookingAway,
-    state.smile
-  );
+  state.handPresent = handPresent;
+  state.openPalm = handPresent ? handOpenPalm : false;
+  state.thumbsUp = handPresent ? handThumbsUp : false;
+
+  updateHandHUD(state.handPresent, state.openPalm, state.thumbsUp);
+
+  const nextLine = pickDialogLineWithHand(facePresent, state.lookingAway, state.smile, {
+    present: state.handPresent,
+    openPalm: state.openPalm,
+    thumbsUp: state.thumbsUp,
+  });
   const stableLine = updateDialogStably(nowMs, nextLine);
   if (state.hudLastText.dialog !== stableLine) {
     state.hudLastText.dialog = stableLine;
