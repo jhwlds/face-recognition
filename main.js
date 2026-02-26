@@ -17,7 +17,6 @@ import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"
 const { FaceLandmarker, HandLandmarker, FilesetResolver, DrawingUtils } = vision;
 
 const demosSection = document.getElementById("demos");
-const imageBlendShapes = document.getElementById("image-blend-shapes");
 const videoBlendShapes = document.getElementById("video-blend-shapes");
 
 const hudSmileEl = document.getElementById("hud-smile");
@@ -83,98 +82,6 @@ async function createLandmarkers() {
 }
 
 createLandmarkers();
-
-/********************************************************************
-// Demo 1: Grab a bunch of images from the page and detect them
-// upon click.
-********************************************************************/
-
-const imageContainers = document.getElementsByClassName("detectOnClick");
-for (const imageContainer of imageContainers) {
-  imageContainer.children[0].addEventListener("click", handleClick);
-}
-
-async function handleClick(event) {
-  if (!faceLandmarker) {
-    console.log("Wait for faceLandmarker to load before clicking!");
-    return;
-  }
-
-  if (runningMode === "VIDEO") {
-    runningMode = "IMAGE";
-    await faceLandmarker.setOptions({ runningMode });
-  }
-
-  // Remove all landmarks drawn before
-  const allCanvas = event.target.parentNode.getElementsByClassName("canvas");
-  for (let i = allCanvas.length - 1; i >= 0; i--) {
-    const n = allCanvas[i];
-    n.parentNode.removeChild(n);
-  }
-
-  const faceLandmarkerResult = faceLandmarker.detect(event.target);
-
-  const canvas = document.createElement("canvas");
-  canvas.setAttribute("class", "canvas");
-  canvas.setAttribute("width", `${event.target.naturalWidth}px`);
-  canvas.setAttribute("height", `${event.target.naturalHeight}px`);
-  canvas.style.left = "0px";
-  canvas.style.top = "0px";
-  canvas.style.width = `${event.target.width}px`;
-  canvas.style.height = `${event.target.height}px`;
-
-  event.target.parentNode.appendChild(canvas);
-  const ctx = canvas.getContext("2d");
-  const drawingUtils = new DrawingUtils(ctx);
-
-  for (const landmarks of faceLandmarkerResult.faceLandmarks) {
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_TESSELATION,
-      { color: "#C0C0C070", lineWidth: 1 }
-    );
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
-      { color: "#FF3030" }
-    );
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW,
-      { color: "#FF3030" }
-    );
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
-      { color: "#30FF30" }
-    );
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW,
-      { color: "#30FF30" }
-    );
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_FACE_OVAL,
-      { color: "#E0E0E0" }
-    );
-    drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LIPS, {
-      color: "#E0E0E0",
-    });
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS,
-      { color: "#FF3030" }
-    );
-    drawingUtils.drawConnectors(
-      landmarks,
-      FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS,
-      { color: "#30FF30" }
-    );
-  }
-
-  drawBlendShapes(imageBlendShapes, faceLandmarkerResult.faceBlendshapes);
-}
 
 /********************************************************************
 // Demo 2: Continuously grab image from webcam stream and detect it.
@@ -594,6 +501,215 @@ function updateHandHUD(present, openPalm, thumbsUp) {
   }
 }
 
+// ------------------------------------------------------------------
+// Motion-friendly pipeline (signals -> rules -> render)
+// Add new motions by appending to SIGNAL_MODULES or RULE_MODULES.
+// ------------------------------------------------------------------
+
+const SIGNAL_MODULES = [
+  {
+    id: "face",
+    update(frame, out) {
+      const facePresent = frame.faceLandmarks.length > 0;
+      out.facePresent = facePresent;
+
+      let rawLookAwayScore = 0;
+      if (facePresent) {
+        for (const landmarks of frame.faceLandmarks) {
+          const { lookAwayScore } = computeLookAwayCombined(landmarks);
+          rawLookAwayScore = Math.max(rawLookAwayScore, lookAwayScore);
+        }
+      }
+
+      let rawSmile = 0;
+      if (frame.faceBlendshapes.length) {
+        const categories = frame.faceBlendshapes[0]?.categories;
+        const cat = blendshapesToMap(categories);
+        rawSmile = computeSmile(cat);
+      }
+
+      if (!facePresent) {
+        rawSmile = 0;
+        rawLookAwayScore = 0;
+      }
+
+      out.rawSmile = rawSmile;
+      out.rawLookAwayScore = rawLookAwayScore;
+    },
+  },
+  {
+    id: "hand",
+    update(frame, out) {
+      const handPresent = frame.handLandmarksList.length > 0;
+      out.handPresent = handPresent;
+
+      let openPalm = false;
+      let thumbsUp = false;
+
+      if (handPresent) {
+        for (const handLandmarks of frame.handLandmarksList) {
+          const g = computeHandGestures(handLandmarks);
+          openPalm = openPalm || g.openPalm;
+          thumbsUp = thumbsUp || g.thumbsUp;
+        }
+      }
+
+      out.openPalm = handPresent ? openPalm : false;
+      out.thumbsUp = handPresent ? thumbsUp : false;
+    },
+  },
+];
+
+const RULE_MODULES = [
+  {
+    id: "dialog",
+    update(frame, signals, out) {
+      const nextLine = pickDialogLineWithHand(
+        signals.facePresent,
+        signals.lookingAway,
+        signals.smile,
+        {
+          present: signals.handPresent,
+          openPalm: signals.openPalm,
+          thumbsUp: signals.thumbsUp,
+        }
+      );
+      out.dialogLine = updateDialogStably(frame.nowMs, nextLine);
+    },
+  },
+];
+
+function makeFrame({ nowMs, dtMs, faceResults, handResults }) {
+  return {
+    nowMs,
+    dtMs,
+    faceLandmarks: faceResults?.faceLandmarks || [],
+    faceBlendshapes: faceResults?.faceBlendshapes || [],
+    handLandmarksList: handResults?.landmarks || [],
+  };
+}
+
+function runSignalModules(frame) {
+  const out = {
+    facePresent: false,
+    rawSmile: 0,
+    rawLookAwayScore: 0,
+    handPresent: false,
+    openPalm: false,
+    thumbsUp: false,
+  };
+  for (const m of SIGNAL_MODULES) m.update(frame, out);
+  return out;
+}
+
+function updateSignalsFromRaw(raw, dtMs) {
+  const a = emaAlpha(dtMs, SCORE_TAU_MS);
+
+  state.smile = state.smile + a * (raw.rawSmile - state.smile);
+  state.lookAwayScore =
+    state.lookAwayScore + a * (raw.rawLookAwayScore - state.lookAwayScore);
+
+  state.smile = clamp01(state.smile);
+  state.lookAwayScore = clamp01(state.lookAwayScore);
+
+  state.lookingAway = updateLookingAwayBool(state.lookingAway, state.lookAwayScore);
+
+  state.handPresent = raw.handPresent;
+  state.openPalm = raw.openPalm;
+  state.thumbsUp = raw.thumbsUp;
+
+  return {
+    facePresent: raw.facePresent,
+    smile: state.smile,
+    lookAwayScore: state.lookAwayScore,
+    lookingAway: state.lookingAway,
+    handPresent: state.handPresent,
+    openPalm: state.openPalm,
+    thumbsUp: state.thumbsUp,
+  };
+}
+
+function runRuleModules(frame, signals) {
+  const out = Object.create(null);
+  for (const r of RULE_MODULES) r.update(frame, signals, out);
+  return out;
+}
+
+function renderFace(frame) {
+  for (const landmarks of frame.faceLandmarks) {
+    drawingUtils.drawConnectors(
+      landmarks,
+      FaceLandmarker.FACE_LANDMARKS_TESSELATION,
+      { color: "#C0C0C070", lineWidth: 1 }
+    );
+    drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, {
+      color: "#FF3030",
+    });
+    drawingUtils.drawConnectors(
+      landmarks,
+      FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW,
+      { color: "#FF3030" }
+    );
+    drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, {
+      color: "#30FF30",
+    });
+    drawingUtils.drawConnectors(
+      landmarks,
+      FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW,
+      { color: "#30FF30" }
+    );
+    drawingUtils.drawConnectors(
+      landmarks,
+      FaceLandmarker.FACE_LANDMARKS_FACE_OVAL,
+      { color: "#E0E0E0" }
+    );
+    drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LIPS, {
+      color: "#E0E0E0",
+    });
+    drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS, {
+      color: "#FF3030",
+    });
+    drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS, {
+      color: "#30FF30",
+    });
+  }
+}
+
+function renderHands(frame) {
+  if (!frame.handLandmarksList.length) return;
+  const conns = HandLandmarker.HAND_CONNECTIONS || [];
+  for (const handLandmarks of frame.handLandmarksList) {
+    if (conns.length) {
+      drawingUtils.drawConnectors(handLandmarks, conns, {
+        color: "#00D1FF",
+        lineWidth: 2,
+      });
+    }
+    drawingUtils.drawLandmarks(handLandmarks, {
+      color: "#00D1FF",
+      lineWidth: 1,
+      radius: 2,
+    });
+  }
+}
+
+function renderDialog(dialogLine) {
+  if (typeof dialogLine !== "string") return;
+  if (state.hudLastText.dialog !== dialogLine) {
+    state.hudLastText.dialog = dialogLine;
+    setTextIfChanged(appleDialogEl, dialogLine);
+  }
+}
+
+function renderBlendshapesMaybe(frame) {
+  if (!frame.faceBlendshapes.length) return;
+  const nowMs = frame.nowMs;
+  if (nowMs - state.lastBlendshapeDomMs > 90) {
+    state.lastBlendshapeDomMs = nowMs;
+    drawBlendShapes(videoBlendShapes, frame.faceBlendshapes);
+  }
+}
+
 let lastVideoTime = -1;
 let results = undefined;
 let handResults = undefined;
@@ -638,138 +754,21 @@ async function predictWebcam() {
   const dtMs = nowMs - state.tPrev;
   state.tPrev = nowMs;
 
-  let facePresent = false;
-  let rawSmile = 0;
-  let rawLookAwayScore = 0;
-  let handPresent = false;
-  let handOpenPalm = false;
-  let handThumbsUp = false;
+  const frame = makeFrame({ nowMs, dtMs, faceResults: results, handResults });
 
-  if (results && results.faceLandmarks && results.faceLandmarks.length) {
-    facePresent = true;
+  renderFace(frame);
+  renderHands(frame);
 
-    for (const landmarks of results.faceLandmarks) {
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_TESSELATION,
-        { color: "#C0C0C070", lineWidth: 1 }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
-        { color: "#FF3030" }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW,
-        { color: "#FF3030" }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
-        { color: "#30FF30" }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW,
-        { color: "#30FF30" }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_FACE_OVAL,
-        { color: "#E0E0E0" }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_LIPS,
-        { color: "#E0E0E0" }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS,
-        { color: "#FF3030" }
-      );
-      drawingUtils.drawConnectors(
-        landmarks,
-        FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS,
-        { color: "#30FF30" }
-      );
+  const raw = runSignalModules(frame);
+  const signals = updateSignalsFromRaw(raw, dtMs);
 
-      const { lookAwayScore } = computeLookAwayCombined(landmarks);
-      rawLookAwayScore = Math.max(rawLookAwayScore, lookAwayScore);
-    }
-  }
+  updateHUD(signals.smile, signals.lookAwayScore, signals.lookingAway);
+  updateHandHUD(signals.handPresent, signals.openPalm, signals.thumbsUp);
 
-  if (handResults && handResults.landmarks && handResults.landmarks.length) {
-    handPresent = true;
+  const ruleOut = runRuleModules(frame, signals);
+  renderDialog(ruleOut.dialogLine);
 
-    for (const handLandmarks of handResults.landmarks) {
-      const conns = HandLandmarker.HAND_CONNECTIONS || [];
-      if (conns.length) {
-        drawingUtils.drawConnectors(handLandmarks, conns, {
-          color: "#00D1FF",
-          lineWidth: 2,
-        });
-      }
-      drawingUtils.drawLandmarks(handLandmarks, {
-        color: "#00D1FF",
-        lineWidth: 1,
-        radius: 2,
-      });
-
-      const g = computeHandGestures(handLandmarks);
-      handOpenPalm = handOpenPalm || g.openPalm;
-      handThumbsUp = handThumbsUp || g.thumbsUp;
-    }
-  }
-
-  if (results && results.faceBlendshapes && results.faceBlendshapes.length) {
-    const categories = results.faceBlendshapes[0]?.categories;
-    const cat = blendshapesToMap(categories);
-    rawSmile = computeSmile(cat);
-  }
-
-  if (!facePresent) {
-    rawSmile = 0;
-    rawLookAwayScore = 0;
-  }
-
-  const a = emaAlpha(dtMs, SCORE_TAU_MS);
-  state.smile = state.smile + a * (rawSmile - state.smile);
-  state.lookAwayScore =
-    state.lookAwayScore + a * (rawLookAwayScore - state.lookAwayScore);
-
-  state.smile = clamp01(state.smile);
-  state.lookAwayScore = clamp01(state.lookAwayScore);
-
-  state.lookingAway = updateLookingAwayBool(state.lookingAway, state.lookAwayScore);
-
-  updateHUD(state.smile, state.lookAwayScore, state.lookingAway);
-
-  state.handPresent = handPresent;
-  state.openPalm = handPresent ? handOpenPalm : false;
-  state.thumbsUp = handPresent ? handThumbsUp : false;
-
-  updateHandHUD(state.handPresent, state.openPalm, state.thumbsUp);
-
-  const nextLine = pickDialogLineWithHand(facePresent, state.lookingAway, state.smile, {
-    present: state.handPresent,
-    openPalm: state.openPalm,
-    thumbsUp: state.thumbsUp,
-  });
-  const stableLine = updateDialogStably(nowMs, nextLine);
-  if (state.hudLastText.dialog !== stableLine) {
-    state.hudLastText.dialog = stableLine;
-    setTextIfChanged(appleDialogEl, stableLine);
-  }
-
-  // Keep existing blendshape list output "as-is", but throttle DOM rebuild.
-  if (results && results.faceBlendshapes) {
-    if (nowMs - state.lastBlendshapeDomMs > 90) {
-      state.lastBlendshapeDomMs = nowMs;
-      drawBlendShapes(videoBlendShapes, results.faceBlendshapes);
-    }
-  }
+  renderBlendshapesMaybe(frame);
 
   canvasCtx.restore();
 
